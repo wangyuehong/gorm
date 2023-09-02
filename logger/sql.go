@@ -34,96 +34,23 @@ var convertibleTypes = []reflect.Type{reflect.TypeOf(time.Time{}), reflect.TypeO
 // RegEx matches only numeric values
 var numericPlaceholderRe = regexp.MustCompile(`\$\d+\$`)
 
+// default sql param formater
+var defaultParamFormater ParamFormater = &paramFormater{
+	timeFormat:       tmFmtWithMS,
+	zeroTimeStr:      tmFmtZero,
+	nullStr:          nullStr,
+	convertibleTypes: convertibleTypes,
+}
+
+func formatParam(val interface{}, escaper string) string {
+	return defaultParamFormater.Format(val, escaper)
+}
+
 // ExplainSQL generate SQL string with given parameters, the generated SQL is expected to be used in logger, execute it might introduce a SQL injection vulnerability
 func ExplainSQL(sql string, numericPlaceholder *regexp.Regexp, escaper string, avars ...interface{}) string {
-	var (
-		convertParams func(interface{}, int)
-		vars          = make([]string, len(avars))
-	)
-
-	convertParams = func(v interface{}, idx int) {
-		switch v := v.(type) {
-		case bool:
-			vars[idx] = strconv.FormatBool(v)
-		case time.Time:
-			if v.IsZero() {
-				vars[idx] = escaper + tmFmtZero + escaper
-			} else {
-				vars[idx] = escaper + v.Format(tmFmtWithMS) + escaper
-			}
-		case *time.Time:
-			if v != nil {
-				if v.IsZero() {
-					vars[idx] = escaper + tmFmtZero + escaper
-				} else {
-					vars[idx] = escaper + v.Format(tmFmtWithMS) + escaper
-				}
-			} else {
-				vars[idx] = nullStr
-			}
-		case driver.Valuer:
-			reflectValue := reflect.ValueOf(v)
-			if v != nil && reflectValue.IsValid() && ((reflectValue.Kind() == reflect.Ptr && !reflectValue.IsNil()) || reflectValue.Kind() != reflect.Ptr) {
-				r, _ := v.Value()
-				convertParams(r, idx)
-			} else {
-				vars[idx] = nullStr
-			}
-		case fmt.Stringer:
-			reflectValue := reflect.ValueOf(v)
-			switch reflectValue.Kind() {
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-				vars[idx] = fmt.Sprintf("%d", reflectValue.Interface())
-			case reflect.Float32, reflect.Float64:
-				vars[idx] = fmt.Sprintf("%.6f", reflectValue.Interface())
-			case reflect.Bool:
-				vars[idx] = fmt.Sprintf("%t", reflectValue.Interface())
-			case reflect.String:
-				vars[idx] = escaper + strings.ReplaceAll(fmt.Sprintf("%v", v), escaper, "\\"+escaper) + escaper
-			default:
-				if v != nil && reflectValue.IsValid() && ((reflectValue.Kind() == reflect.Ptr && !reflectValue.IsNil()) || reflectValue.Kind() != reflect.Ptr) {
-					vars[idx] = escaper + strings.ReplaceAll(fmt.Sprintf("%v", v), escaper, "\\"+escaper) + escaper
-				} else {
-					vars[idx] = nullStr
-				}
-			}
-		case []byte:
-			if s := string(v); isPrintable(s) {
-				vars[idx] = escaper + strings.ReplaceAll(s, escaper, "\\"+escaper) + escaper
-			} else {
-				vars[idx] = escaper + "<binary>" + escaper
-			}
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-			vars[idx] = utils.ToString(v)
-		case float32:
-			vars[idx] = strconv.FormatFloat(float64(v), 'f', -1, 32)
-		case float64:
-			vars[idx] = strconv.FormatFloat(v, 'f', -1, 64)
-		case string:
-			vars[idx] = escaper + strings.ReplaceAll(v, escaper, "\\"+escaper) + escaper
-		default:
-			rv := reflect.ValueOf(v)
-			if v == nil || !rv.IsValid() || rv.Kind() == reflect.Ptr && rv.IsNil() {
-				vars[idx] = nullStr
-			} else if valuer, ok := v.(driver.Valuer); ok {
-				v, _ = valuer.Value()
-				convertParams(v, idx)
-			} else if rv.Kind() == reflect.Ptr && !rv.IsZero() {
-				convertParams(reflect.Indirect(rv).Interface(), idx)
-			} else {
-				for _, t := range convertibleTypes {
-					if rv.Type().ConvertibleTo(t) {
-						convertParams(rv.Convert(t).Interface(), idx)
-						return
-					}
-				}
-				vars[idx] = escaper + strings.ReplaceAll(fmt.Sprint(v), escaper, "\\"+escaper) + escaper
-			}
-		}
-	}
-
-	for idx, v := range avars {
-		convertParams(v, idx)
+	vars := make([]string, len(avars))
+	for i, val := range avars {
+		vars[i] = formatParam(val, escaper)
 	}
 
 	if numericPlaceholder == nil {
@@ -159,4 +86,125 @@ func ExplainSQL(sql string, numericPlaceholder *regexp.Regexp, escaper string, a
 	}
 
 	return sql
+}
+
+// ParamFormater is used to format SQL parameters.
+type ParamFormater interface {
+	// Format formats the given parameter value with escaper.
+	Format(val interface{}, escaper string) string
+}
+
+// paramFormater is the default implementation of ParamFormater
+type paramFormater struct {
+	timeFormat string
+	// zeroTimeStr is used as formated value for zero time, if leave it empty, use timeFormat to format zero time.
+	zeroTimeStr      string
+	nullStr          string
+	convertibleTypes []reflect.Type
+}
+
+// Format formats the given parameter with escape for SQL log
+func (p *paramFormater) Format(val interface{}, escaper string) string {
+	switch v := val.(type) {
+	case bool:
+		return strconv.FormatBool(v)
+	case time.Time:
+		return p.formatTime(v, escaper)
+	case *time.Time:
+		if v == nil {
+			return p.formatNull()
+		}
+		return p.formatTime(*v, escaper)
+	case driver.Valuer:
+		if isNilValue(v) {
+			return p.formatNull()
+		}
+		r, _ := v.Value()
+		return p.Format(r, escaper)
+	case fmt.Stringer:
+		reflectValue := reflect.ValueOf(v)
+		switch reflectValue.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			return fmt.Sprintf("%d", reflectValue.Interface())
+		case reflect.Float32, reflect.Float64:
+			return fmt.Sprintf("%.6f", reflectValue.Interface())
+		case reflect.Bool:
+			return fmt.Sprintf("%t", reflectValue.Interface())
+		case reflect.String:
+			return p.escapeStr(fmt.Sprintf("%v", v), escaper)
+		default:
+			if isNilValue(v) {
+				return p.formatNull()
+			}
+			return p.escapeStr(fmt.Sprintf("%v", v), escaper)
+		}
+	case []byte:
+		if s := string(v); isPrintable(s) {
+			return p.escapeStr(s, escaper)
+		}
+		return p.escape("<binary>", escaper)
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return utils.ToString(v)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case string:
+		return p.escapeStr(v, escaper)
+	default:
+		if isNilValue(v) {
+			return p.formatNull()
+		}
+
+		if valuer, ok := v.(driver.Valuer); ok {
+			v, _ = valuer.Value()
+			return p.Format(v, escaper)
+		}
+
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Ptr && !rv.IsZero() {
+			return p.Format(reflect.Indirect(rv).Interface(), escaper)
+		}
+
+		for _, t := range p.convertibleTypes {
+			if rv.Type().ConvertibleTo(t) {
+				return p.Format(rv.Convert(t).Interface(), escaper)
+			}
+		}
+
+		return p.escapeStr(fmt.Sprint(v), escaper)
+	}
+}
+
+func (p *paramFormater) formatTime(t time.Time, escaper string) string {
+	var strVal string
+	if t.IsZero() && p.zeroTimeStr != "" {
+		strVal = p.zeroTimeStr
+	} else {
+		strVal = t.Format(p.timeFormat)
+	}
+
+	return p.escapeStr(strVal, escaper)
+}
+
+func (p *paramFormater) formatNull() string { return p.nullStr }
+
+func (p *paramFormater) escapeStr(s, escaper string) string {
+	s = strings.ReplaceAll(s, escaper, "\\"+escaper)
+	return p.escape(s, escaper)
+}
+
+func (*paramFormater) escape(v, escaper string) string {
+	return escaper + v + escaper
+}
+
+func isNilValue(v interface{}) bool {
+	if v == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	notNil := rv.IsValid() && ((rv.Kind() == reflect.Ptr && !rv.IsNil()) || rv.Kind() != reflect.Ptr)
+	return !notNil
 }
